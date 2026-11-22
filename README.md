@@ -1157,3 +1157,94 @@ Az újabb CUDA verziók egyik legfontosabb újítása, amely GPU-oldalon élő f
  * Mi történik, ha egy streamre besorolt műveletek közé egy műveletet a 0-s (default) streamre küldünk? Implicit globális szinkronizáció következik be, megszüntetve a streamek közötti átlapolódást.
  * Mikor éri meg CUDA Graph-ot használni? Sok rövid kernel ismételt futtatásakor (a launch overhead csökkentésére), komplex függőségi hálóknál, illetve iteratív algoritmusoknál (while conditional node-dal a host-oldali szinkronizáció kiváltására).
 
+A GPU202627 class6 (http://www.youtube.com/watch?v=vkbeROr_qmE) előadás teljes, vizsgakész összefoglalója két nagy egységre bontva: az óra fő szakmai tananyagára (NVIDIA matematikai könyvtárak és Python CUDA ökoszisztéma), valamint az előadás végén részletesen átvett vizsgatematikára és számonkérési tudnivalókra.
+I. NVIDIA GPU könyvtárak és a CUDA Python ökoszisztéma
+1. Alapvető NVIDIA GPU matematikai könyvtárak
+Az előadás első blokkja a nagy teljesítményű, gyárilag optimalizált CUDA könyvtárakat mutatta be, amelyeket bonyolultabb numerikus műveleteknél (pl. FFT, mátrixfaktorizáció, párhuzamos véletlenszám-generálás) célszerűbb használni a saját, nulláról írt kernelek helyett:
+ * cuBLAS (CUDA Basic Linear Algebra Subprograms):
+   * Három algoritmus-szint:
+     * Level 1: Vektor–vektor és vektor–skalár műveletek (O(n)), pl. axpy (\alpha x + y), skaláris szorzat (dot), skálázás (scal).
+     * Level 2: Mátrix–vektor műveletek (O(n^2)), pl. gemv (y = \alpha \cdot \text{op}(A)x + \beta y).
+     * Level 3: Mátrix–mátrix műveletek (O(n^3)), pl. gemm (C = \alpha \cdot \text{op}(A)\text{op}(B) + \beta C). Automatikusan képes kihasználni a hardveres Tensor Core egységeket is.
+   * Fortran-77 nevezéktan és adattípus-prefixek: A függvénynevek elején álló betű jelzi a pontosságot: S (32-bit float), D (64-bit double), C (32-bit komplex), Z (64-bit komplex) — pl. cublasDgemm.
+   * Oszlopfolytonos (Column-Major) tárolás: A Fortran örökség miatt a cuBLAS oszlopfolytonosan várja a mátrixokat. C/Python (Row-Major, C-contiguous) tömbök átadásakor figyelni kell a leading dimension (lda, ldb, ldc — a memóriában egymás melletti oszlopok/sorok közötti lépésköz) helyes megadására, különben transzponált eredményt vagy memóriahibát kapunk.
+   * Működési modell: Implicit állapotgép, amely egy cublasHandle_t kontextuson és egy CUDA streamen keresztül működik; a skalár szorzókat (\alpha, \beta) pointerként/cím szerint kell átadni.
+ * cuFFT (CUDA Fast Fourier Transform):
+   * Idő- és frekvenciatartomány közötti gyors (O(N \log N)) átalakításra szolgál (R2C, C2C, C2R transzformációk), felépítése az FFTW könyvtárat követi.
+   * Működési elv: Először egy plan konfigurációt kell létrehozni (amely rögzíti a transzformáció méretét, típusát és a memóriabeli lépésközöket/stride-okat, pl. cufftPlanMany), majd az Exec függvénnyel futtatjuk.
+   * NVMath Dx (Device Extensions): Míg a klasszikus cuBLAS és cuFFT függvények alapvetően host-oldalról hívhatók, a modern Device Extension könyvtárak lehetővé teszik ezek meghívását közvetlenül egy saját CUDA kernel belsejéből is.
+ * cuRAND (CUDA Random Number Generation):
+   * Párhuzamos pszeudo- és kvázi-véletlenszám-generátor. Kritikus fontosságú Monte Carlo szimulációkban, mert a naiv, szálanként eltolt (seed-elt) szekvenciális generátorok korrelációkat és sűrűsödési pontokat okoznak a szálak között.
+   * Előnye: Kezdettől fogva támogatja mind a host-oldali tömbös generálást, mind a device-oldali API-t (minden szál saját curandState állapotkontextussal rendelkezik, és közvetlenül a kernelből húz független, egyenletes vagy normális eloszlású számokat).
+2. A CUDA Python absztrakciós rétegei
+A Python ökoszisztéma az alacsony szintű C-s API-k közvetlen elérésétől a magas szintű, kódmódosítást alig igénylő drop-in könyvtárakig terjed (felfelé haladva csökken a kódmennyiség, de csökken a finomhangolási és memóriakezelési kontroll is):
+| Réteg / Eszköz | Szerep és működési elv | Kontroll vs. Kényelem |
+|---|---|---|
+| cuda-python (cuda.bindings, cuda.cudart, cuda.core) | A nyers CUDA Driver és Runtime API-k Python-kötései (bindingjei). Teljes körű alacsony szintű kontrollt ad a device-ok, streamek, eventek és memóriafoglalások felett. | Maximális kontroll, alacsony absztrakció. |
+| nvmath-python | Közvetlen Python binding az NVIDIA matematikai könyvtáraihoz (cuBLAS, cuFFT stb.). C-típusú pointereket, ctypes címátadást és explicit handle/stream kezelést igényel. | Alacsony szintű könyvtár-API, nagy teljesítmény. |
+| Numba CUDA (@cuda.jit) | Beágyazott DSL, amely a Python egy részhalmazát LLVM/NVVM-en keresztül PTX kódra fordítja (majd a driver natív SASS gépi kódra). Saját egyedi kernelek írására szolgál. | Teljes algoritmikus kontroll a szálak és a shared memory felett. |
+| CuPy (import cupy as cp) | NumPy/SciPy drop-in helyettesítő. Saját ndarray típust és memory pool allokátort használ, a háttérben pedig automatikusan a cuBLAS/cuFFT/cuRAND könyvtárakat hívja. | Magas kényelem, minimális kódmódosítás. |
+| RAPIDS (cuDF, cuML, cuGraph) | Adattudományi és gépi tanulási stack (GPU-gyorsított Pandas és Scikit-learn). Jupyter/Colab környezetben %load_ext cudf.pandas / cuml.accel line magic parancsokkal kódírás nélkül is aktiválható. | Legmagasabb absztrakció, automatikus CPU–GPU mozgatás (kis adatoknál másolási overhead veszélye!). |
+II. Vizsgatematika és számonkérési összefoglaló
+Vizsgainformációk és formátum
+ * Formátum: Személyes, papíralapú, kézzel írott írásbeli vizsga (90 perc), magyar nyelven.
+ * Felépítés és pontozás: 5 esszé/kifejtős kérdés, egyenként 5 pontért (összesen 25 pont). Kérdésenként 0,5–1 oldalnyi kifejtés az elvárt irányadó terjedelem (az ábrák, vázlatok beleszámítanak és ajánlottak).
+ * Időpontok: 2026. december 12., valamint januárban heti rendszerességgel szombati napokon.
+ * Kódolási elvárás: Nem kell fejből hosszú programokat írni, de a C++ és Numba Python kernel-deklaráció és -indítás szintaxisát, valamint a párhuzamos algoritmustervezés (szál–probléma leképezés, memóriahasználat) elveit tudni kell.
+ * Megjegyzés: A 6. óra második felében bemutatott szuperszámítógépes (Komondor / HPE Cray EX / Slurm / MPI) kitekintés nem része a vizsgaanyagnak.
+A vizsgatematika 11 fő témaköre
+1. CPU vs. GPU architektúra
+ * CPU (Multicore): Kevesebb, nagy teljesítményű mag, hatalmas gyorsítótárak (cache) és komplex vezérlőlogika (elágazásbecslés, out-of-order végrehajtás). Cél: alacsony késleltetés (low latency) szekvenciális feladatoknál.
+ * GPU (Manycore): Több ezer egyszerűbb számítóegység (ALU), kisebb cache, SIMT (Single Instruction, Multiple Threads) végrehajtási modell. Cél: magas átbocsátóképesség (high throughput) tömegesen párhuzamos műveleteknél.
+2. CUDA végrehajtási és memóriahierarchia
+ * Hardver–szoftver megfeleltetés:
+   * SP / CUDA mag (Stream Processor) \leftrightarrow Szál (Thread): az elemi számítási egység.
+   * SM (Streaming Multiprocessor) \leftrightarrow Szálblokk (Thread Block): az elemi ütemezési egység; az SM erőforrásain (regiszterek, shared memory) osztozik.
+   * Teljes GPU \leftrightarrow Grid: a kernel összes blokkjának összessége.
+ * Memóriahierarchia (növekvő méret, csökkenő sebesség irányában):
+   * Regiszterek: Szál-exkluzív (thread-local), leggyorsabb elérés.
+   * Shared Memory: Blokkon belül közös (block-exclusive), alacsony késleltetésű chipen belüli memória.
+   * Global Memory (DRAM): Az egész grid által elérhető, nagy kapacitású, de nagy késleltetésű VRAM.
+ * Szinkronizáció: Blokkon belül lehetséges (__syncthreads() / cuda.syncthreads()). Különböző blokkok egymástól függetlenek, device-oldalról nem szinkronizálhatók — blokkok közötti globális szinkronizációhoz host-oldali hívás (cudaDeviceSynchronize(), cudaStreamSynchronize()) vagy új kernel indítása szükséges.
+3. A CUDA kernel és szintaxisa
+A kernel az elemi programozási egység, amely egyetlen szál futási logikáját írja le. A kernelnek átadott tömböknek mindig a device memóriában kell lenniük, a skalár primitívek érték szerint adódnak át.
+ * C++ CUDA:
+   * Deklaráció: __global__ void myKernel(...)
+   * Indítás: myKernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(args);
+ * Python (Numba CUDA):
+   * Deklaráció: @cuda.jit dekorátorral ellátott def my_kernel(...):
+   * Indítás: my_kernel[grid_dim, block_dim, stream, shared_mem_bytes](args) (Figyelem: a stream és a shared memory paraméterek sorrendje fordított a C++-hoz képest!)
+4. A CUDA Python ökoszisztéma felépítése
+ * Míg a C++ CUDA alulról felfelé építkezett (előbb a kernel-nyelv, majd a könyvtárak), a Python ökoszisztéma felülről lefelé alakult ki.
+ * Rétegek: Alul a cuda.bindings (Driver API) és cuda.cudart (Runtime API) található. Erre épül a Numba CUDA (@cuda.jit), amely a Python-kódot PTX köztes assemblyre fordítja, amit a GPU-driver a futtatáskor natív SASS gépi kóddá fordít. Erre az alapra támaszkodnak a magasabb szintű könyvtárak (CuPy, RAPIDS, PyTorch).
+5. Lokalitás és a Shared Memory szerepe
+ * Időbeli lokalitás (Temporal locality): Ha egy globális memóriából beolvasott értéket vagy köztes eredményt rövid időn belül többször is felhasználunk, regiszterben vagy shared memoryban tartjuk ahelyett, hogy kiírnánk és visszaolvasnánk a lassú globális memóriából.
+ * Térbeli lokalitás (Spatial locality): A memóriában egymás mellett lévő, közösen feldolgozott adatokat (pl. csempézett/tiled mátrixszorzásnál vagy konvolúciónál) egy lépésben betöltjük a blokk shared memoryjába, így drasztikusan csökkentjük a globális memória-tranzakciók számát.
+6. Memóriakezelés a Python CUDA ökoszisztémában
+ * A Python keretrendszerek elfedik a nyers C-pointereket:
+   * CuPy: Saját memory poolt tart fenn a GPU-n (egy nagy blokkot foglal le, és saját allokátorral osztja ki a tömböket), elkerülve a drága cudaMalloc/cudaFree rendszerhívásokat.
+   * Numba CUDA: Explicit memóriakezelést biztosít (cuda.device_array(), cuda.to_device(), copy_to_host()), támogatja az aszinkron átvitelt pinned (page-locked) host-memóriával (cuda.pinned_array()), valamint a C-sorfolytonos és Fortran-oszlopfolytonos elrendezés kezelését.
+   * cuda.core: Magasabb szintű, objektumorientált Memory Resource absztrakcióval kezeli a device- és host-oldali allokációkat.
+7. Kollektív műveletek (Párhuzamos redukció)
+ * Olyan műveletek, amelyekben a párhuzamos rendszer összes egysége részt vesz egy közös eredmény előállításában (pl. összegzés, min/max keresés).
+ * Optimalizálási elv: A naiv, szomszédos elemeket párosító (interleaved) fa-redukció warp divergenciát és shared memory bank conflict-ot okoz. Ehelyett szekvenciális címzést (felező/hajtogató lépésközt) alkalmazunk, így a warpon belüli aktív szálak egymás mellett maradnak.
+8. GPU-programok teljesítménymérése
+ * Hardveres alapmetrikák:
+   * Peak FLOPS: Elméleti maximális lebegőpontos számítási teljesítmény (FLOP/s).
+   * Peak Memory Bandwidth: A GPU saját globális memóriabuszának csúcs-sávszélessége (GB/s).
+   * PCIe sávszélesség: A CPU és a GPU közötti adatátviteli csatorna sebessége.
+ * Profilozás: Annak mérése (pl. Nsight Systems és Nsight Compute segítségével), hogy a programunk a hardver elméleti csúcsértékeinek hány százalékát használja ki, és hol keletkezik szűk keresztmetszet.
+9. A Roofline teljesítménymodell
+ * Log–log diagram, amely az aritmetikai intenzitás (\text{FLOP/Byte}, X-tengely) függvényében ábrázolja az elért számítási teljesítményt (\text{FLOP/s}, Y-tengely).
+ * Két korlátozó egyenes:
+   * Memóriakorlát (Memory-bound zóna, bal oldal): Ferde egyenes, meredekségét a maximális memóriasávszélesség adja. Kevés művelet jut egy bájtra; optimalizálása kernel fúzióval (kernel fusion, több egymás utáni kernel összevonása a globális memóriába történő köztes kiírások elkerülésére) vagy shared memory csempézéssel történik.
+   * Számítási korlát (Compute-bound zóna, jobb oldal): Vízszintes plafon a GPU Peak FLOPS értékénél. A két szakasz találkozása a töréspont (ridge point) — az ideális algoritmus minél magasabban, ehhez a ponthoz közel helyezkedik el.
+ * További szűk keresztmetszetek: Warp divergence (elágazások miatti szerializáció), nem összevont (uncoalesced) globális memóriahozzáférés, illetve atomi műveletek miatti versengés.
+10. CUDA Streamek
+ * A CUDA stream egy aszinkron végrehajtási sor (work queue).
+ * Egy streamen belül a műveletek (memóriamásolások, kernelek) szigorúan FIFO sorrendben futnak, míg a különböző streamek egymástól függetlenül, párhuzamosan is végrehajtódhatnak (pl. számítás és PCIe adatátvitel átfedése / overlapping).
+ * Szinkronizáció: A független streamek közötti függőségek CUDA Eventek segítségével hangolhatók össze (cudaStreamWaitEvent), míg host-oldalról a cudaStreamSynchronize() vagy a globális cudaDeviceSynchronize() használható.
+11. CUDA Graph
+ * A streamek fölötti absztrakciós réteg, amely a teljes munkafolyamatot egy irányított aciklikus függőségi gráfként (DAG) modellezi (csomópontok: kernelek/másolások, élek: függőségek).
+ * Életciklus: Gráf definiálása \rightarrow példányosítása (instantiation) \rightarrow futtatása egy streamen.
+ * Előnye: Sok apró kernel egymás utáni indításánál összeadódik a CPU–GPU driver indítási késleltetése (mikroszekundumokból milliszekundumok lesznek). A CUDA Graph egyetlen műveletként indítja el a teljes gráfot, így az indítási overhead egyetlen kerneléhez mérhető, miközben a független ágak automatikusan konkurensen futnak.
