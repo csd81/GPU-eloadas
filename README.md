@@ -1067,3 +1067,93 @@ Az egyszerű `cuda.to_device(arr)` hívás minden alkalommal új memóriát fogl
 
 * Saját *memory poolt* tart fenn mind a host, mind a device oldalon.
 * Elsődleges célja, hogy a NumPy jelentős részhalmazát *drop-in replacement* módon, hardveragnosztikus kóddal gyorsítsa GPU-n, nem pedig a kézi memóriakezelés.
+
+
+GPU202627 class5 2 — Streamek, Eventek és CUDA Gráfok
+Forrás: http://www.youtube.com/watch?v=KmoVMCymspg
+1. Párhuzamosítási stratégiák és a CUDA Stream alapjai
+A klasszikus adatpárhuzamos (SIMT – Single Instruction, Multiple Threads) végrehajtás mellett a pipelining (futószalagos feldolgozás) teszi lehetővé, hogy az egymástól független műveletek — például a memóriamásolás és a számítás — időben átlapolódjanak.
+ * Mi a CUDA Stream? Egy GPU-oldali munkasor (FIFO work queue). Egyetlen streamen belül a besorolt műveletek (memóriamásolások, kernelek, event rögzítések) mindig szigorúan egymás után, sorrendben futnak le (implicit streamen belüli szinkronizáció).
+ * Miért használunk több streamet?
+   * GPU kihasználtság (SM szaturáció) növelése: Ha egy kernel nem foglalja le az összes Streaming Multiprocessort (SM), egy másik streamen konkurensen elindított kernel kitöltheti a szabad erőforrásokat.
+   * Latency & Copy Overhead Hiding: Miközben az egyik streamen egy kernel számol, egy másik streamen a DMA (Direct Memory Access) engine párhuzamosan másolhatja a következő adatszeletet a PCI Express buszon,.
+ * Hardveres evolúció:
+   * Fermi előtt: Két stream nem tudott egyszerre számítást végezni.
+   * Fermi: Megjelent a konkurens kernelfuttatás (egyszerre max. 16 kernel).
+   * Kepler és újabbak: Több független hardveres work queue (Hyper-Q), így a különböző streamek valóban egymástól függetlenül ütemezhetők a GPU-n.
+2. Aszinkron végrehajtás és Pinned Memory
+Alapértelmezés szerint a CUDA hívások (pl. cudaMemcpy) blokkolóak: a CPU-szál addig várakozik, amíg az adatátvitel a PCIe buszon be nem fejeződik. Az aszinkron működéshez két feltételnek kell teljesülnie:
+ * Aszinkron API hívások használata: A hívások azonnal visszatérnek a CPU-n, csupán besorolják (enqueue) a műveletet a megadott streamre.
+ * Page-locked (Pinned) Memory használata:
+   * Az operációs rendszer által lapozható (pageable) memóriából nem indítható közvetlen aszinkron DMA átvitel, mert a memóriaoldal címe futás közben megváltozhat.
+   * C++-ban: cudaMallocHost()
+   * Pythonban (Numba / cuda.core): cuda.pinned_array() vagy PinnedMemoryResource.
+   * Fontos szabály Pythonban: A pinned tömb feltöltésekor és darabolásakor mindig nézeteket (view) szabad csak használni (pl. arr[:] = ..., np.array_split()). Ha új NumPy tömböt hozunk létre másolással, elveszik a page-locked tulajdonság,.
+Stream életciklus és műveletek összehasonlítása
+| Művelet | C++ CUDA Runtime API | Python (cuda.core / Numba) | Megjegyzés |
+|---|---|---|---|
+| Stream létrehozása | cudaStreamCreate(&stream) | stream = dev.create_stream() | A cuda.core stream támogatja az eventeket és gráfokat is. |
+| Stream felszabadítása | cudaStreamDestroy(stream) | stream.close() | Pythonban bezárja/érvényteleníti a streamet. |
+| Aszinkron H2D másolás | cudaMemcpyAsync(..., cudaMemcpyHostToDevice, stream) | cuda.to_device(src, to=dst, stream=s) | Pinned memóriát igényel. |
+| Kernel indítása streamen | kernel<<<grid, block, shared, stream>>>(...) | kernel[grid, block, stream](...) | A 3. konfigurációs paraméter a stream (ha nincs megadva: default stream),. |
+| Aszinkron D2H másolás | cudaMemcpyAsync(..., cudaMemcpyDeviceToHost, stream) | dst.copy_to_host(src, stream=s) | Szintén a stream kulcsszóval adható meg. |
+3. Szinkronizáció: Implicit csapdák és Explicit eszközök
+Implicit globális szinkronizáció (kerülendő teljesítménycsapdák)
+Bár a különböző nem-default streamek alapesetben függetlenek, az alábbi műveletek minden aktív streamet globálisan szinkronizálnak (megállítva a párhuzamosságot):
+ * Default stream (0-s stream) használata: Bármilyen művelet a 0-s streamen szinkronizál az összes többi streamhez képest.
+ * Szinkron (nem-Async) memóriaműveletek: cudaMalloc, cudaMemcpy, cudaMemset stb.
+ * L1 cache / Shared memory konfiguráció módosítása futás közben.
+Explicit szinkronizációs mechanizmusok
+| Mechanizmus | C++ API | Python (cuda.core / Numba) | Hatás és sebesség |
+|---|---|---|---|
+| Globális szinkronizáció | cudaDeviceSynchronize() | cuda.synchronize() | Leglassabb: blokkolja a hostot, amíg a GPU összes streamjén minden művelet be nem fejeződik. |
+| Stream-szintű szinkronizáció | cudaStreamSynchronize(s) | s.sync() | Közepes: csak az adott s stream befejezéséig blokkolja a hostot. |
+| Stream-közi barrier (Event) | cudaStreamWaitEvent(s, ev) | s.wait(ev) | Leggyorsabb (nem blokkolja a hostot!): az s stream a GPU-n megvárja az ev event aktiválódását, miközben a CPU tovább fut. |
+| Állapotlekérdezés | cudaStreamQuery(s) | (nincs direkt megfelelő) | Nem blokkoló ellenőrzés, hogy végzett-e a stream. |
+4. CUDA Eventek és GPU-oldali időmérés
+Az Event egy streambe besorolható jelölő (marker), amely akkor aktiválódik, amikor a stream végrehajtása eléri azt a pontot.
+Felhasználási területek
+ * Streamek közötti szinkronizáció (Producer–Consumer minta): Az S1 streamen egy kernel után rögzítünk egy eventet (s1.record(ev)), az S2 stream pedig a s2.wait(ev) hívással megvárja ezt, mielőtt elindítaná a függő műveletet — mindezt CPU beavatkozás nélkül,.
+ * Pontos GPU-oldali időmérés:
+   * Két eventet (start, end) hozunk létre (Pythonban az EventOptions objektummal engedélyezni kell a timing tulajdonságot, mert C++-tól eltérően itt alapból ki van kapcsolva),.
+   * Besorolás: stream.record(start) \rightarrow mért kernelek/másolások \rightarrow stream.record(end).
+   * Ezután end.sync() hívással megvárjuk a végét, és lekérdezzük a két event közötti időkülönbséget. A mérés azért pontos, mert a streamen belüli FIFO sorrend garantálja, hogy a start és az end közötti műveletek nem lapolódnak át.
+5. Gyakorlati minták és Nsight Systems profilozás
+A) Tömbszeleteléses Pipelining (stream.py demó)
+ * A bemeneti adatot egyetlen cuda.pinned_array tömbbe foglaljuk.
+ * Az np.array_split segítségével másolásmentes NumPy nézetekre (slice-okra) osztjuk.
+ * Minden szelethez saját stream és cuda.device_array_like puffer tartozik.
+ * Egy ciklusban minden szeletre besoroljuk a to_device (H2D) \rightarrow kernel \rightarrow copy_to_host (D2H) láncot a saját streamjére, majd a ciklus végén cuda.synchronize() hívással várjuk meg a végét,.
+ * Profilozás (nsys profile): Az .nsys-rep fájlban a CUDA HW -> All Streams soron ellenőrizhető, hogy a kernelek és a DMA másolások valóban párhuzamos sávokon (streameken) futnak. Megjegyzés: túl kicsi tömbméret és alacsony aritmetikai intenzitás mellett a launch/transfer overhead dominál, ezért a gyorsuláshoz megfelelően nagy feladatméret szükséges.
+B) Számítás és adatátvitel szétválasztása (Plazmaszimuláció esettanulmány)
+ * Két dedikált streamet (compute_stream és copy_stream) használunk.
+ * Amint a compute_stream befejez egy részeredményt (electron_done event), a copy_stream aszinkron módon elkezdi azt visszamásolni, miközben a compute_stream azonnal folytatja a következő független számítást (electron_density).
+6. CUDA Gráfok (CUDA Graphs)
+A CUDA Graph nem egy lineáris műveletsor, hanem egy teljes munkafolyamatot (workload) és annak tetszőleges függőségeit leíró irányított aciklikus gráf (DAG).
+Miért gyorsabb a CUDA Graph a sima streameknél?
+ * Launch Overhead eliminálása: Sok rövid kernel egymás utáni indításakor a CPU-oldali kernelindítási idő (launch overhead) jelentős. Egy teljes CUDA Graph elindítása azonban nagyjából ugyanannyi overhead-del jár, mint egyetlen kernelé.
+ * Implicit ütemezés és optimalizáció: A gráf élei (edges) meghatározzák a csúcspontok (nodes: kernelek, memóriaműveletek, eventek, algráfok) közötti függőségeket, így a runtime automatikusan párhuzamosítja a független ágakat,.
+ * Programmatic Dependent Launch (PDL): Vezérlési függőség (control dependency) esetén két egymásra épülő kernel átlapolódva is elindulhat, ha a második kernel futásának elején még nincs szüksége az első kernel kimenetére.
+Gráfok létrehozása és életciklusa
+ * Leíró vs. Példányosítás (C++): A gráf felépítése után (cudaGraph_t) példányosítani kell (cudaGraphInstantiate \rightarrow cudaGraphExec_t), és ezt a futtatható példányt indítjuk el (cudaGraphLaunch).
+ * Két építési mód:
+   * Stream Capture: Egy nem-default streamen a beginCapture és endCapture között kiadott aszinkron hívásokat a runtime nem futtatja le, hanem rögzíti és gráffá alakítja.
+   * Programatikus építés: C++-ban rendkívül bőbeszédű (boilerplate, void* argumentumtömbök, tagged union struktúrák), Pythonban viszont a cuda.core GraphBuilder egységes, tömör felületet ad,:
+     builder = stream.create_graph_builder()
+builder.begin_building()
+# ... kernelek és memóriaműveletek besorolása ...
+builder.end_building()
+graph = builder.complete()
+graph.upload(stream)   # példányosítás / feltöltés
+graph.launch(stream)   # végrehajtás
+
+Conditional Nodes (GPU-oldali feltételes vezérlés)
+Az újabb CUDA verziók egyik legfontosabb újítása, amely GPU-oldalon élő feltételváltozókat (condition variable) használ. Ezt egy kernelből a cudaGraphSetConditional hívással állíthatjuk be.
+ * Támogatott szerkezetek (GraphBuilder): if_cond, if_else, switch, és while csúcspontok, amelyek saját beágyazott részgráfokat vezérelnek.
+ * Gyakorlati jelentősége (pl. Multigrid Poisson-megoldó): Iteratív numerikus algoritmusoknál a konvergenciavizsgálat és a ciklusvezérlés (while node) teljesen a GPU-n belül marad. Nem kell minden iterációban globálisan szinkronizálni a GPU-t és visszamásolni a hibanormát a CPU-nak, ami drasztikusan felgyorsítja a futást,.
+7. Vizsga-ellenőrzőlista (Gyors ismétlés)
+ * Miért kell pinned memory az aszinkron másoláshoz? Mert csak a nem lapozható fizikai memóriaterületre képes a DMA vezérlő közvetlenül, CPU-beavatkozás és memóriaoldal-elmozdulás kockázata nélkül írni/olvasni.
+ * Mi a különbség a cudaDeviceSynchronize(), cudaStreamSynchronize() és a cudaStreamWaitEvent() között? Az első az egész GPU-t és a hostot blokkolja; a második csak egy adott stream befejezéséig blokkolja a hostot; a harmadik nem blokkolja a hostot, csak két stream között hoz létre GPU-oldali függőséget.
+ * Mi történik, ha egy streamre besorolt műveletek közé egy műveletet a 0-s (default) streamre küldünk? Implicit globális szinkronizáció következik be, megszüntetve a streamek közötti átlapolódást.
+ * Mikor éri meg CUDA Graph-ot használni? Sok rövid kernel ismételt futtatásakor (a launch overhead csökkentésére), komplex függőségi hálóknál, illetve iteratív algoritmusoknál (while conditional node-dal a host-oldali szinkronizáció kiváltására).
+
